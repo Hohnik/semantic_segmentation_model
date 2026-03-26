@@ -94,6 +94,7 @@ class EfficientUNetSegmentation(L.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=[encoder, decoder])
         self.train_data, self.val_data = dataset()
+        self._logged_hyperparams = False
         self.encoder = encoder
         self.decoder = decoder
         self.miou = MeanIoU(
@@ -143,6 +144,15 @@ class EfficientUNetSegmentation(L.LightningModule):
         self._log_images(images, preds, labels)
 
         return loss
+
+    def on_validation_epoch_end(self):
+        # Log hyperparameters with metric after first validation
+        if not self._logged_hyperparams and self.current_epoch == 0:
+            self.logger.log_hyperparams(
+                self.hparams,
+                {"hp_metric": self.trainer.callback_metrics.get("val_iou", 0.0)},
+            )
+            self._logged_hyperparams = True
 
     def configure_optimizers(self):  # type: ignore
         match self.hparams["optimizer_name"].lower():
