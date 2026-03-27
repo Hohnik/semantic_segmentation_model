@@ -49,7 +49,7 @@ def main():
 
     logger = TensorBoardLogger("tb_logs", name="EffUNetSemSeg")
     trainer = L.Trainer(
-        fast_dev_run=10,
+        # fast_dev_run=10,
         accelerator="gpu"
         if torch.cuda.is_available()
         else "mps"
