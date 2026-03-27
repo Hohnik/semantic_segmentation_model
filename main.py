@@ -1,6 +1,7 @@
 import os
 import torch
 from torchmetrics.segmentation import MeanIoU
+from torchmetrics.classification import MulticlassAccuracy
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -16,6 +17,7 @@ lr = 0.003
 weight_decay = 0.0003
 batch_size = 6
 epochs = 100
+resume_checkpoint = "checkpoints/last.ckpt"  # Set to a path or None
 
 
 class EfficientUNetSegmentation(torch.nn.Module):
@@ -78,9 +80,14 @@ def main():
         lr=lr,
         weight_decay=weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=3, factor=0.5
+    )
 
     miou_metric = MeanIoU(19).to(device)
+    accuracy_metric = MulticlassAccuracy(
+        num_classes=19, ignore_index=-1, average="micro"
+    ).to(device)
     writer = SummaryWriter(log_dir="tb_logs/EffUNetSemSeg")
 
     # MACs 570 Mio
@@ -90,12 +97,26 @@ def main():
 
     os.makedirs("checkpoints", exist_ok=True)
 
+    start_epoch = 0
     best_val_miou = 0.0
 
-    for epoch in range(epochs):
+    if resume_checkpoint is not None and os.path.isfile(resume_checkpoint):
+        print(f"Loading checkpoint '{resume_checkpoint}'")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_val_miou = checkpoint.get("val_miou", 0.0)
+        print(
+            f"Resuming from epoch {start_epoch} with best val mIoU {best_val_miou:.4f}"
+        )
+
+    for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
         miou_metric.reset()
+        accuracy_metric.reset()
 
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch} Train")
         for batch_idx, (images, labels) in enumerate(train_pbar):
@@ -109,6 +130,7 @@ def main():
 
             preds = torch.argmax(logits, dim=1)
             miou_metric.update(preds, labels)
+            accuracy_metric.update(preds, labels)
 
             train_loss += loss.item()
             train_pbar.set_postfix({"loss": loss.item()})
@@ -121,13 +143,16 @@ def main():
 
         avg_train_loss = train_loss / len(train_loader)
         train_miou = miou_metric.compute()
+        train_acc = accuracy_metric.compute()
         writer.add_scalar("train_loss", avg_train_loss, epoch)
         writer.add_scalar("train_miou", train_miou, epoch)
+        writer.add_scalar("train_acc", train_acc, epoch)
 
         # Validation
         model.eval()
         val_loss = 0.0
         miou_metric.reset()
+        accuracy_metric.reset()
         val_images, val_preds, val_labels = None, None, None
 
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch} Val")
@@ -142,6 +167,7 @@ def main():
 
                 preds = torch.argmax(logits, dim=1)
                 miou_metric.update(preds, labels)
+                accuracy_metric.update(preds, labels)
 
                 val_loss += loss.item()
                 val_images, val_preds, val_labels = images, preds, labels
@@ -149,15 +175,17 @@ def main():
 
         avg_val_loss = val_loss / len(val_loader)
         val_miou = miou_metric.compute()
+        val_acc = accuracy_metric.compute()
 
         writer.add_scalar("val_loss", avg_val_loss, epoch)
         writer.add_scalar("val_miou", val_miou, epoch)
+        writer.add_scalar("val_acc", val_acc, epoch)
 
         log_images(writer, val_images, val_preds, val_labels, epoch)
 
         scheduler.step(avg_val_loss)
         print(
-            f"Epoch {epoch}: Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f} | Val mIoU {val_miou:.4f}"
+            f"Epoch {epoch}: Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f} | Val mIoU {val_miou:.4f} | Val Acc {val_acc:.4f}"
         )
 
         # Checkpointing
