@@ -1,183 +1,180 @@
 import os
-
-import lightning as L
 import torch
-from lightning.pytorch.callbacks import (
-    LearningRateMonitor,
-    ModelCheckpoint,
-    TQDMProgressBar,
-)
-from lightning.pytorch.loggers import TensorBoardLogger
 from torchmetrics.segmentation import MeanIoU
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from dataset import dataset
 from decoder import MobileNetV2Decoder
 from encoder import MobileNetV2Encoder
 from torchprofile import profile_macs
+from torchvision.utils import make_grid
 
 torch.serialization.add_safe_globals([MobileNetV2Encoder, MobileNetV2Decoder])
 
 lr = 0.003
 weight_decay = 0.0003
 batch_size = 6
+epochs = 100
 
 
-def main():
-    encoder = MobileNetV2Encoder(width_mult=1.0, depth_mult=1.0)
-    decoder = MobileNetV2Decoder(width_mult=1.0)
-
-    semantic_segmentation = EfficientUNetSegmentation(
-        encoder,
-        decoder,
-        lr=lr,
-        weight_decay=weight_decay,
-        batch_size=batch_size,
-    )
-
-    # MACs 570 Mio
-    example_input = torch.randn(1, 3, 256, 512)
-    macs = profile_macs(semantic_segmentation.eval(), example_input)
-    print(f"MACs: {int(macs) / 1e6:.2f} M")  # type:ignore
-
-    checkpoints = ModelCheckpoint(
-        "checkpoints",
-        filename="EffUNetSeg-{epoch:02d}-{val_miou:.2f}",
-        monitor="val_miou",
-        save_last=True,
-        save_weights_only=False,
-    )
-    progress_bar = TQDMProgressBar()
-    lr_monitor = LearningRateMonitor(logging_interval="step")
-
-    logger = TensorBoardLogger("tb_logs", name="EffUNetSemSeg")
-    trainer = L.Trainer(
-        # fast_dev_run=10,
-        accelerator="gpu"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.mps.is_available()
-        else "cpu",
-        logger=logger,
-        callbacks=[checkpoints, progress_bar, lr_monitor],
-        precision="16-mixed",
-    )
-    trainer.fit(
-        model=semantic_segmentation,
-    )
-
-
-class EfficientUNetSegmentation(L.LightningModule):
-    def __init__(self, encoder, decoder, lr, weight_decay, batch_size):
+class EfficientUNetSegmentation(torch.nn.Module):
+    def __init__(self, encoder, decoder):
         super().__init__()
-        self.saved_hparams = False
-        self.hparams["lr"] = lr
-        self.hparams["weight_decay"] = weight_decay
-        self.hparams["batch_size"] = batch_size
-
         self.encoder = encoder
         self.decoder = decoder
-
-        self.train_data, self.val_data = dataset()
-        self.miou = MeanIoU(
-            19
-        )  # https://lightning.ai/docs/torchmetrics/stable/segmentation/mean_iou.html
-
-    def train_dataloader(self):
-        return torch.utils.data.DataLoader(
-            self.train_data,
-            batch_size=self.hparams["batch_size"],
-            num_workers=(os.cpu_count() or 6) - 2,
-            persistent_workers=True,
-            pin_memory=True,
-        )
-
-    def val_dataloader(self):
-        return torch.utils.data.DataLoader(
-            self.val_data,
-            batch_size=self.hparams["batch_size"],
-            num_workers=(os.cpu_count() or 6) - 2,
-            persistent_workers=True,
-            pin_memory=True,
-        )
 
     def forward(self, x):
         skips = self.encoder(x)
         logits = self.decoder(skips)
         return logits
 
-    def training_step(self, batch, batch_idx):
-        images, labels = batch
-        logits = self(images)
-        preds = torch.argmax(logits, dim=1)
 
-        loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-1)
-        self.miou.update(preds, labels)
-        self.curr_loss = loss.item()
+def log_images(writer, images, preds, labels, epoch):
+    img_grid = make_grid(images[:4], normalize=True)
+    pred_grid = make_grid(preds[:4].unsqueeze(1).float() / 19)
+    label_grid = make_grid(labels[:4].unsqueeze(1).float() / 19)
 
-        return loss
+    writer.add_image("input", img_grid, epoch)
+    writer.add_image("preds", pred_grid, epoch)
+    writer.add_image("labels", label_grid, epoch)
 
-    def on_train_epoch_end(self):
-        self.log("train_loss", self.curr_loss)
-        self.log("train_miou", self.miou.compute())
 
-    def validation_step(self, batch, batch_idx):
-        images, labels = batch
-        logits = self(images)
-        preds = torch.argmax(logits, dim=1)
+def main():
+    device = (
+        torch.device("cuda")
+        if torch.cuda.is_available()
+        else torch.device("mps")
+        if torch.mps.is_available()
+        else torch.device("cpu")
+    )
 
-        loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-1)
-        self.curr_loss = loss.item()
-        self.miou.update(preds, labels)
-        self.curr_images = images
-        self.curr_preds = preds
-        self.curr_labels = labels
+    encoder = MobileNetV2Encoder(width_mult=1.0, depth_mult=1.0)
+    decoder = MobileNetV2Decoder(width_mult=1.0)
 
-        return loss
+    model = EfficientUNetSegmentation(encoder, decoder).to(device)
 
-    def on_validation_epoch_end(self):
-        miou = self.miou.compute()
-        self.log("val_miou", miou, prog_bar=True)
-        self.log("val_loss", self.curr_loss, prog_bar=True)
-        self._log_images(self.curr_images, self.curr_preds, self.curr_labels)
+    train_data, val_data = dataset()
 
-        if not self.saved_hparams:
-            self.save_hyperparameters(ignore=[self.encoder, self.decoder])
-            self.saved_hparams = True
+    train_loader = torch.utils.data.DataLoader(
+        train_data,
+        batch_size=batch_size,
+        num_workers=(os.cpu_count() or 6) - 2,
+        persistent_workers=True,
+        pin_memory=True,
+        shuffle=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_data,
+        batch_size=batch_size,
+        num_workers=(os.cpu_count() or 6) - 2,
+        persistent_workers=True,
+        pin_memory=True,
+        shuffle=False,
+    )
 
-    def configure_optimizers(self):  # type: ignore
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams["lr"],
-            weight_decay=self.hparams["weight_decay"],
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+
+    miou_metric = MeanIoU(19).to(device)
+    writer = SummaryWriter(log_dir="tb_logs/EffUNetSemSeg")
+
+    # MACs 570 Mio
+    example_input = torch.randn(1, 3, 256, 512).to(device)
+    macs = profile_macs(model.eval(), example_input)
+    writer.add_scalar("MACs", macs)
+
+    os.makedirs("checkpoints", exist_ok=True)
+
+    best_val_miou = 0.0
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        miou_metric.reset()
+
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch} Train")
+        for batch_idx, (images, labels) in enumerate(train_pbar):
+            images, labels = images.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            logits = model(images)
+            loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-1)
+            loss.backward()
+            optimizer.step()
+
+            preds = torch.argmax(logits, dim=1)
+            miou_metric.update(preds, labels)
+
+            train_loss += loss.item()
+            train_pbar.set_postfix({"loss": loss.item()})
+
+            writer.add_scalar(
+                "lr",
+                optimizer.param_groups[0]["lr"],
+                epoch * len(train_loader) + batch_idx,
+            )
+
+        avg_train_loss = train_loss / len(train_loader)
+        train_miou = miou_metric.compute()
+        writer.add_scalar("train_loss", avg_train_loss, epoch)
+        writer.add_scalar("train_miou", train_miou, epoch)
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        miou_metric.reset()
+        val_images, val_preds, val_labels = None, None, None
+
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch} Val")
+        with torch.no_grad():
+            for images, labels in val_pbar:
+                images, labels = images.to(device), labels.to(device)
+
+                logits = model(images)
+                loss = torch.nn.functional.cross_entropy(
+                    logits, labels, ignore_index=-1
+                )
+
+                preds = torch.argmax(logits, dim=1)
+                miou_metric.update(preds, labels)
+
+                val_loss += loss.item()
+                val_images, val_preds, val_labels = images, preds, labels
+                val_pbar.set_postfix({"loss": loss.item()})
+
+        avg_val_loss = val_loss / len(val_loader)
+        val_miou = miou_metric.compute()
+
+        writer.add_scalar("val_loss", avg_val_loss, epoch)
+        writer.add_scalar("val_miou", val_miou, epoch)
+
+        log_images(writer, val_images, val_preds, val_labels, epoch)
+
+        scheduler.step(avg_val_loss)
+        print(
+            f"Epoch {epoch}: Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f} | Val mIoU {val_miou:.4f}"
         )
 
-        # warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1 / 10)
-        # cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #     optimizer, T_max=20, eta_min=1e-5
-        # )
-        # scheduler = torch.optim.lr_scheduler.ChainedScheduler(
-        #     [warmup, cosine], optimizer
-        # )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
-        return [optimizer], [
-            {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-            }
-        ]
+        # Checkpointing
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "val_miou": val_miou.item(),
+        }
+        torch.save(checkpoint, "checkpoints/last.ckpt")
 
-    def _log_images(self, images, preds, labels):
-        from torchvision.utils import (
-            make_grid,
-        )  # https://docs.pytorch.org/vision/main/auto_examples/others/plot_visualization_utils.html -> Further improvements on visualization
-
-        img_grid = make_grid(images[:4], normalize=True)
-        pred_grid = make_grid(preds[:4].unsqueeze(1).float() / 19)
-        label_grid = make_grid(labels[:4].unsqueeze(1).float() / 19)
-
-        self.logger.experiment.add_image("input", img_grid, self.current_epoch)  # type: ignore
-        self.logger.experiment.add_image("preds", pred_grid, self.current_epoch)  # type: ignore
-        self.logger.experiment.add_image("labels", label_grid, self.current_epoch)  # type: ignore
+        if val_miou > best_val_miou:
+            best_val_miou = val_miou
+            torch.save(
+                checkpoint, f"checkpoints/EffUNetSeg-{epoch:02d}-{val_miou:.2f}.ckpt"
+            )
 
 
 if __name__ == "__main__":
