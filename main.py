@@ -1,6 +1,8 @@
 from typing import Literal
+import os
 
 import lightning as L
+from lightning.pytorch.utilities.types import STEP_OUTPUT
 import optuna
 import torch
 from lightning.pytorch.callbacks import (
@@ -18,52 +20,36 @@ from encoder import MobileNetV2Encoder
 
 torch.serialization.add_safe_globals([MobileNetV2Encoder, MobileNetV2Decoder])
 
+lr = 0.001
+weight_decay = 0.0001
+batch_size = 16
 
-def main(trial: optuna.Trial):
-    optimizer_name = trial.suggest_categorical("optimizer_name", ["AdamW", "SGD"])
-    scheduler_name = trial.suggest_categorical(
-        "scheduler_name", ["CosineAnnealing", "ReduceOnPlateau"]
-    )
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-    batch_size = trial.suggest_int("batch_size", 1, 16, log=True)
 
-    if optimizer_name == "AdamW":
-        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-        momentum = 0.0
-    elif optimizer_name == "SGD":
-        momentum = trial.suggest_float("momentum", 0.0, 0.99)
-        weight_decay = 0.0
-    else:
-        raise ValueError("Define optimizer via optimizer_name")
+def main():
+    encoder = MobileNetV2Encoder(width_mult=1.0, depth_mult=1.0)
+    decoder = MobileNetV2Decoder(width_mult=1.0)
 
-    encoder = MobileNetV2Encoder()
-    decoder = MobileNetV2Decoder()
-
-    segmenter = EfficientUNetSegmentation(
+    semantic_segmentation = EfficientUNetSegmentation(
         encoder,
         decoder,
         lr=lr,
         weight_decay=weight_decay,
-        momentum=momentum,
-        optimizer_name=optimizer_name,
-        scheduler_name=scheduler_name,
         batch_size=batch_size,
     )
 
     checkpoints = ModelCheckpoint(
         "checkpoints",
-        filename="EffUNetSeg-{epoch}-{val_iou:.2f}",
-        monitor="val_iou",
+        filename="EffUNetSeg-{epoch:02d}-{val_miou:.2f}",
+        monitor="val_miou",
         save_last=True,
         save_weights_only=False,
     )
     progress_bar = TQDMProgressBar()
-    lr_monitor = LearningRateMonitor()
+    lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    logger = TensorBoardLogger("tb_logs", name="EfficientUNetSegmentation")
+    logger = TensorBoardLogger("tb_logs", name="EffUNetSemSeg")
     trainer = L.Trainer(
-        limit_train_batches=100,
-        max_epochs=10,
+        fast_dev_run=10,
         accelerator="gpu"
         if torch.cuda.is_available()
         else "mps"
@@ -71,32 +57,25 @@ def main(trial: optuna.Trial):
         else "cpu",
         logger=logger,
         callbacks=[checkpoints, progress_bar, lr_monitor],
+        precision="16-mixed",
     )
     trainer.fit(
-        model=segmenter,
+        model=semantic_segmentation,
     )
-
-    return trainer.callback_metrics.get("val_iou", 0.0).item()
 
 
 class EfficientUNetSegmentation(L.LightningModule):
-    def __init__(
-        self,
-        encoder,
-        decoder,
-        lr,
-        momentum,
-        weight_decay,
-        batch_size,
-        optimizer_name: Literal["AdamW", "SGD"] | str,
-        scheduler_name: Literal["CosineAnnealing", "ReduceOnPlateau"] | str,
-    ):
+    def __init__(self, encoder, decoder, lr, weight_decay, batch_size):
         super().__init__()
-        self.save_hyperparameters(ignore=[encoder, decoder])
-        self.train_data, self.val_data = dataset()
-        self._logged_hyperparams = False
+        self.saved_hparams = False
+        self.hparams["lr"] = lr
+        self.hparams["weight_decay"] = weight_decay
+        self.hparams["batch_size"] = batch_size
+
         self.encoder = encoder
         self.decoder = decoder
+
+        self.train_data, self.val_data = dataset()
         self.miou = MeanIoU(
             19
         )  # https://lightning.ai/docs/torchmetrics/stable/segmentation/mean_iou.html
@@ -105,16 +84,18 @@ class EfficientUNetSegmentation(L.LightningModule):
         return torch.utils.data.DataLoader(
             self.train_data,
             batch_size=self.hparams["batch_size"],
-            num_workers=0,  # os.cpu_count() or 1,
-            # persistent_workers=True,
+            num_workers=(os.cpu_count() or 6) - 2,
+            persistent_workers=True,
+            pin_memory=True,
         )
 
     def val_dataloader(self):
         return torch.utils.data.DataLoader(
             self.val_data,
             batch_size=self.hparams["batch_size"],
-            num_workers=0,  # os.cpu_count() or 1
-            # persistent_workers=True,
+            num_workers=(os.cpu_count() or 6) - 2,
+            persistent_workers=True,
+            pin_memory=True,
         )
 
     def forward(self, x):
@@ -124,12 +105,18 @@ class EfficientUNetSegmentation(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         images, labels = batch
-
         logits = self(images)
-        loss = torch.nn.functional.cross_entropy(
-            input=logits, target=labels, ignore_index=-1
-        )
+        preds = torch.argmax(logits, dim=1)
+
+        loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-1)
+        self.miou.update(preds, labels)
+        self.curr_loss = loss.item()
+
         return loss
+
+    def on_train_epoch_end(self):
+        self.log("train_loss", self.curr_loss)
+        self.log("train_miou", self.miou.compute())
 
     def validation_step(self, batch, batch_idx):
         images, labels = batch
@@ -137,54 +124,43 @@ class EfficientUNetSegmentation(L.LightningModule):
         preds = torch.argmax(logits, dim=1)
 
         loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-1)
-        miou = self.miou(preds, labels)
-
-        self.log("val_iou", miou, prog_bar=True)
-        self.log("val_loss", loss, prog_bar=True)
-        self._log_images(images, preds, labels)
+        self.curr_loss = loss.item()
+        self.miou.update(preds, labels)
+        self.curr_images = images
+        self.curr_preds = preds
+        self.curr_labels = labels
 
         return loss
 
     def on_validation_epoch_end(self):
-        # Log hyperparameters with metric after first validation
-        if not self._logged_hyperparams and self.current_epoch == 0:
-            self.logger.log_hyperparams(
-                self.hparams,
-                {"hp_metric": self.trainer.callback_metrics.get("val_iou", 0.0)},
-            )
-            self._logged_hyperparams = True
+        miou = self.miou.compute()
+        self.log("val_miou", miou, prog_bar=True)
+        self.log("val_loss", self.curr_loss, prog_bar=True)
+        self._log_images(self.curr_images, self.curr_preds, self.curr_labels)
+
+        if not self.saved_hparams:
+            self.save_hyperparameters(ignore=[self.encoder, self.decoder])
+            self.saved_hparams = True
 
     def configure_optimizers(self):  # type: ignore
-        match self.hparams["optimizer_name"].lower():
-            case "adamw":
-                optimizer = torch.optim.AdamW(
-                    self.parameters(),
-                    lr=self.hparams["lr"],
-                    weight_decay=self.hparams["weight_decay"],
-                )
-            case "sgd":
-                optimizer = torch.optim.SGD(
-                    self.parameters(),
-                    lr=self.hparams["lr"],
-                    momentum=self.hparams["momentum"],
-                )
-            case _:
-                raise ValueError("Define optimizer via optimizer_name")
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams["weight_decay"],
+        )
 
-        match self.hparams["scheduler_name"].lower():
-            case "cosineannealing":
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=20, eta_min=1e-5
-                )
-            case "reduceonplateau":
-                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
-            case _:
-                raise ValueError("Define LearingRateScheduler via scheduler_name")
-
+        warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1 / 10)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=20, eta_min=1e-5
+        )
+        scheduler = torch.optim.lr_scheduler.ChainedScheduler(
+            [warmup, cosine], optimizer
+        )
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
         return [optimizer], [
             {
                 "scheduler": scheduler,
-                "monitor": "val_iou",
+                "monitor": "val_loss",
             }
         ]
 
@@ -203,22 +179,4 @@ class EfficientUNetSegmentation(L.LightningModule):
 
 
 if __name__ == "__main__":
-    tensorboard_callback = TensorBoardCallback("tb_logs/optuna", metric_name="val_iou")
-
-    # Delete existing optuna logs to avoid conflicts
-    import shutil
-
-    shutil.rmtree("tb_logs/optuna", ignore_errors=True)
-
-    study = optuna.create_study(
-        direction="maximize",
-        study_name="EffUNetSegOptimization",
-    )
-    study.optimize(main, n_trials=20, callbacks=[tensorboard_callback])
-
-    print("Best trial:")
-    trial = study.best_trial
-    print(f"  Value: {trial.value:.4f}")
-    print("  Params: ")
-    for key, value in trial.params.items():
-        print(f"    {key}: {value}")
+    main()
