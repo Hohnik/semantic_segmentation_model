@@ -1,9 +1,6 @@
-from typing import Literal
 import os
 
 import lightning as L
-from lightning.pytorch.utilities.types import STEP_OUTPUT
-import optuna
 import torch
 from lightning.pytorch.callbacks import (
     LearningRateMonitor,
@@ -11,7 +8,6 @@ from lightning.pytorch.callbacks import (
     TQDMProgressBar,
 )
 from lightning.pytorch.loggers import TensorBoardLogger
-from optuna.integration import TensorBoardCallback
 from torchmetrics.segmentation import MeanIoU
 
 from dataset import dataset
@@ -20,9 +16,9 @@ from encoder import MobileNetV2Encoder
 
 torch.serialization.add_safe_globals([MobileNetV2Encoder, MobileNetV2Decoder])
 
-lr = 0.001
-weight_decay = 0.0001
-batch_size = 16
+lr = 0.003
+weight_decay = 0.0003
+batch_size = 6
 
 
 def main():
@@ -149,14 +145,14 @@ class EfficientUNetSegmentation(L.LightningModule):
             weight_decay=self.hparams["weight_decay"],
         )
 
-        warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1 / 10)
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=20, eta_min=1e-5
-        )
-        scheduler = torch.optim.lr_scheduler.ChainedScheduler(
-            [warmup, cosine], optimizer
-        )
-        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+        # warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1 / 10)
+        # cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     optimizer, T_max=20, eta_min=1e-5
+        # )
+        # scheduler = torch.optim.lr_scheduler.ChainedScheduler(
+        #     [warmup, cosine], optimizer
+        # )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
         return [optimizer], [
             {
                 "scheduler": scheduler,
