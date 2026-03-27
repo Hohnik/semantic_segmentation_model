@@ -13,6 +13,7 @@ from torchmetrics.segmentation import MeanIoU
 from dataset import dataset
 from decoder import MobileNetV2Decoder
 from encoder import MobileNetV2Encoder
+from torchprofile import profile_macs
 
 torch.serialization.add_safe_globals([MobileNetV2Encoder, MobileNetV2Decoder])
 
@@ -32,6 +33,11 @@ def main():
         weight_decay=weight_decay,
         batch_size=batch_size,
     )
+
+    # MACs 570 Mio
+    example_input = torch.randn(1, 3, 256, 512)
+    macs = profile_macs(semantic_segmentation.eval(), example_input)
+    print(f"MACs: {int(macs) / 1e6:.2f} M")  # type:ignore
 
     checkpoints = ModelCheckpoint(
         "checkpoints",
