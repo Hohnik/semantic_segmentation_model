@@ -1,7 +1,7 @@
 import os
 import torch
 from torchmetrics.segmentation import MeanIoU
-from torchmetrics.classification import MulticlassAccuracy
+from torchmetrics.classification import MulticlassAccuracy, MulticlassJaccardIndex
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -84,7 +84,9 @@ def main():
         optimizer, patience=3, factor=0.5
     )
 
-    miou_metric = MeanIoU(19).to(device)
+    miou_metric = MulticlassJaccardIndex(
+        num_classes=19, ignore_index=-1, average="macro"
+    ).to(device)
     accuracy_metric = MulticlassAccuracy(
         num_classes=19, ignore_index=-1, average="micro"
     ).to(device)
