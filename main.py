@@ -1,7 +1,7 @@
 import os
 import torch
 from torchmetrics.segmentation import MeanIoU
-from torchmetrics.classification import MulticlassAccuracy, MulticlassJaccardIndex
+from torchmetrics.classification import MulticlassAccuracy
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -84,24 +84,30 @@ def main():
         optimizer, patience=3, factor=0.5
     )
 
-    miou_metric = MulticlassJaccardIndex(
-        num_classes=19, ignore_index=-1, average="macro"
-    ).to(device)
-    accuracy_metric = MulticlassAccuracy(
-        num_classes=19, ignore_index=-1, average="micro"
-    ).to(device)
+    miou = MeanIoU(19, include_background=False).to(device)
+    accuracy = MulticlassAccuracy(num_classes=19, ignore_index=-1, average="micro").to(
+        device
+    )
     writer = SummaryWriter(log_dir="tb_logs/EffUNetSemSeg")
+
+    writer.add_text("Learning Rate", str(lr))
+    writer.add_text("Learning Rate", str(lr))
+    writer.add_text("Weight Decay", weight_decay)
+    writer.add_text("Batch Size", batch_size)
+    writer.add_text("Epochs", epochs)
+    writer.add_text("CPU/GPU", device.type)
 
     # MACs 570 Mio
     example_input = torch.randn(1, 3, 256, 512).to(device)
     macs = profile_macs(model.eval(), example_input)
-    writer.add_scalar("MACs", macs)
+    writer.add_text("MACs", macs)
 
     os.makedirs("checkpoints", exist_ok=True)
 
     start_epoch = 0
     best_val_miou = 0.0
 
+    # Checkpoint continuing
     if resume_checkpoint is not None and os.path.isfile(resume_checkpoint):
         print(f"Loading checkpoint '{resume_checkpoint}'")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
@@ -114,11 +120,12 @@ def main():
             f"Resuming from epoch {start_epoch} with best val mIoU {best_val_miou:.4f}"
         )
 
+    # Training loop
     for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
-        miou_metric.reset()
-        accuracy_metric.reset()
+        miou.reset()
+        accuracy.reset()
 
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch} Train")
         for batch_idx, (images, labels) in enumerate(train_pbar):
@@ -131,8 +138,8 @@ def main():
             optimizer.step()
 
             preds = torch.argmax(logits, dim=1)
-            miou_metric.update(preds, labels)
-            accuracy_metric.update(preds, labels)
+            miou.update(preds, labels)
+            accuracy.update(preds, labels)
 
             train_loss += loss.item()
             train_pbar.set_postfix({"loss": loss.item()})
@@ -144,17 +151,17 @@ def main():
             )
 
         avg_train_loss = train_loss / len(train_loader)
-        train_miou = miou_metric.compute()
-        train_acc = accuracy_metric.compute()
+        train_miou = miou.compute()
+        train_acc = accuracy.compute()
         writer.add_scalar("train_loss", avg_train_loss, epoch)
         writer.add_scalar("train_miou", train_miou, epoch)
         writer.add_scalar("train_acc", train_acc, epoch)
 
-        # Validation
+        # Validation loop
         model.eval()
         val_loss = 0.0
-        miou_metric.reset()
-        accuracy_metric.reset()
+        miou.reset()
+        accuracy.reset()
         val_images, val_preds, val_labels = None, None, None
 
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch} Val")
@@ -168,16 +175,16 @@ def main():
                 )
 
                 preds = torch.argmax(logits, dim=1)
-                miou_metric.update(preds, labels)
-                accuracy_metric.update(preds, labels)
+                miou.update(preds, labels)
+                accuracy.update(preds, labels)
 
                 val_loss += loss.item()
                 val_images, val_preds, val_labels = images, preds, labels
                 val_pbar.set_postfix({"loss": loss.item()})
 
         avg_val_loss = val_loss / len(val_loader)
-        val_miou = miou_metric.compute()
-        val_acc = accuracy_metric.compute()
+        val_miou = miou.compute()
+        val_acc = accuracy.compute()
 
         writer.add_scalar("val_loss", avg_val_loss, epoch)
         writer.add_scalar("val_miou", val_miou, epoch)

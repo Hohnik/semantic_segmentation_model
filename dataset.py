@@ -34,22 +34,23 @@ def originalId2trainId(img):
     ]  # 6:10 -> 5:30 with smarter indexing (next time cProfile before!)
 
 
+img_transform = transforms.Compose(
+    [
+        transforms.Resize((256, 512), InterpolationMode.NEAREST),
+        transforms.ToTensor(),  # Also scales pixel values [0, 255] -> [0.0, 1.0]
+    ]
+)
+tar_transform = transforms.Compose(
+    [
+        transforms.Resize((256, 512), InterpolationMode.NEAREST),
+        transforms.PILToTensor(),
+        transforms.Lambda(originalId2trainId),
+    ]
+)
+
+
 def dataset():
     """Return a tuple with (train_dataset, validation_dataset)."""
-
-    img_transform = transforms.Compose(
-        [
-            transforms.Resize((256, 512), InterpolationMode.NEAREST),
-            transforms.ToTensor(),  # Also scales pixel values [0, 255] -> [0.0, 1.0]
-        ]
-    )
-    tar_transform = transforms.Compose(
-        [
-            transforms.Resize((256, 512), InterpolationMode.NEAREST),
-            transforms.PILToTensor(),
-            transforms.Lambda(originalId2trainId),
-        ]
-    )
 
     train_ds = Cityscapes(
         root="data",

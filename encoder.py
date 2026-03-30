@@ -10,13 +10,13 @@ class MobileNetV2Encoder(nn.Module):
 
         self.first_layer = nn.Conv2d(
             in_channels=3,
-            out_channels=16,
+            out_channels=channels[0],
             kernel_size=3,
             stride=2,
             padding=1,
             bias=False,
         )  # img size 1/2
-        self.first_norm = nn.BatchNorm2d(16)
+        self.first_norm = nn.BatchNorm2d(channels[0])
         self.first_relu = nn.ReLU6()
 
         self.stage1 = self.create_block(channels[0], channels[1], blocks[0], 4)  # 1/4

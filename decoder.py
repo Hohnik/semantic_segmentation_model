@@ -13,7 +13,7 @@ class MobileNetV2Decoder(nn.Module):
 
         self.upsample = nn.UpsamplingBilinear2d(scale_factor=2)  # 1/1
         self.final_conv = nn.Conv2d(
-            16, 19, 1, bias=True
+            channels[-1], 19, 1, bias=True
         )  # bias added like in the paper
 
     def forward(self, skips):
