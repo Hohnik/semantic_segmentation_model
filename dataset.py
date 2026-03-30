@@ -1,8 +1,8 @@
-from torchvision.datasets import Cityscapes
-from torchvision import transforms
-from torchvision.transforms import InterpolationMode
 import torch
 import tqdm
+from torchvision import transforms
+from torchvision.datasets import Cityscapes
+from torchvision.transforms import InterpolationMode
 
 # https://github.com/mcordts/cityscapesScripts/blob/master/cityscapesscripts/helpers/labels.py
 orgId2trainId = torch.full((256,), -1, dtype=torch.long)
@@ -74,6 +74,8 @@ def dataset():
 
 if __name__ == "__main__":
     train_ds, val_ds = dataset()
+    print(len(train_ds))
+    print(len(val_ds))
 
     r = tqdm.trange(100)
     for i in r:
