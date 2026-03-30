@@ -60,7 +60,4 @@ While training I'm calculating the mIoU (mean Intersection over Union) as well a
 
 The best loss on the validation set is 0.345 and the best mIoU is 0.982 while this value is only achievable because the MeanIoU function has no option to ignore a specific class/label and so it also counts the ignored classes. When using the `include_background=False` parameter, the mIoU is at 0.41 but in this case the street class which is about 30%-40% of every image is also seen as background and not counted in the mIoU value. The best pixel accuracy is 0.89.
 
-Here is an example of the predicted segmentation mask for one image from the validation set:
-
-![Input Image](./inference/input/bielefeld_000000_027586_leftImg8bit.png)
-![Predicted Mask](./inference/output/segmented_bielefeld_000000_027586_leftImg8bit.png)
+**find more information in the `report.pdf`**
